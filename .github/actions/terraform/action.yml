@@ -1,0 +1,105 @@
+name: 'Terraform deployment action'
+description: 'Terraform deployment action'
+inputs:
+  PROJECT_NAME:
+    required: true
+  ORGANISATION_NAME:
+    required: true
+  ENVIRONMENT_SHORT:
+    required: true
+  TERRAFORM_WORKING_DIR_PATH:
+    required: true
+  TERRAFORM_BACKEND_FILE_PATH:
+    required: true
+  AZURE_TENANT_ID:
+    required: true
+  AZURE_SPN_ID:
+    required: true
+  AZURE_SPN_OBJECT_ID:
+    required: true
+  AZURE_SPN_SECRET:
+    required: true
+  AZURE_SUBSCRIPTION_ID:
+    required: true
+  AZURE_RG_NAME:
+    required: true
+  GITHUB_PAT_TOKEN:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set Environment Secrets
+      shell: bash
+      run: |  
+        echo "TERRAFORM_STORAGE_NAME=tfstate${{ inputs.PROJECT_NAME }}${{ inputs.ENVIRONMENT_SHORT }}" >> $GITHUB_ENV
+        echo "ARM_TENANT_ID=${{ inputs.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+        echo "ARM_CLIENT_ID=${{ inputs.AZURE_SPN_ID }}" >> $GITHUB_ENV
+        echo "ARM_CLIENT_OBJECT_ID=${{ inputs.AZURE_SPN_OBJECT_ID }}" >> $GITHUB_ENV
+        echo "ARM_CLIENT_SECRET=${{ inputs.AZURE_SPN_SECRET }}" >> $GITHUB_ENV
+        echo "ARM_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+
+    - name: Azure CLI Install
+      shell: bash
+      run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+    - name: Azure CLI Login
+      shell: bash
+      run: |
+        az login --service-principal --username "${{ inputs.AZURE_SPN_ID }}" --password "${{ inputs.AZURE_SPN_SECRET }}" --tenant "${{ inputs.AZURE_TENANT_ID }}"
+        az account set --subscription "${{ inputs.AZURE_SUBSCRIPTION_ID }}"
+
+    - name: Setup Authorization to pull TF modules
+      shell: bash
+      run: |
+        git config --local --remove-section http."https://github.com/"
+        git config --global url."https://foo:${{ inputs.GITHUB_PAT_TOKEN }}@github.com/happsdk/terraform-modules".insteadOf "https://github.com/happsdk/terraform-modules"
+
+    - name: Find or create Terraform storage
+      shell: bash
+      id: state-storage-exists
+      run: |
+        storage_exists=$(az storage account check-name --name 'tfstate${{ inputs.PROJECT_NAME }}${{ inputs.ENVIRONMENT_SHORT }}' | python3 -c "import sys, json; print(not json.load(sys.stdin)['nameAvailable'])")
+        if [ "$storage_exists" = True ]; then
+          echo "Storage exists";
+          exit;
+        fi
+        az storage account create --resource-group ${{ inputs.AZURE_RG_NAME }} --name ${{ env.TERRAFORM_STORAGE_NAME }} --sku Standard_LRS --encryption-services blob
+        account_key=$(az storage account keys list --resource-group ${{ inputs.AZURE_RG_NAME }} --account-name ${{ env.TERRAFORM_STORAGE_NAME }} --query '[0].value' -o tsv)
+        az storage container create --name tfstate --account-name ${{ env.TERRAFORM_STORAGE_NAME }} --account-key $account_key
+
+    - name: Set default Terraform variables
+      shell: bash
+      run: |
+        echo "TF_VAR_environment=${{ inputs.ENVIRONMENT_SHORT }}" >> $GITHUB_ENV
+        echo "TF_VAR_organisation=${{ inputs.ORGANISATION_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_project=${{ inputs.PROJECT_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_resource_group_name=${{ inputs.AZURE_RG_NAME }}" >> $GITHUB_ENV
+    
+    - name: Configure environment specific infrastructure
+      shell: bash
+      working-directory: ${{ inputs.TERRAFORM_WORKING_DIR_PATH }}
+      run: |
+        cp -fR ./env/${{ inputs.ENVIRONMENT_SHORT }}/* ./main
+
+    - name: Configure Terraform Backend
+      shell: bash
+      run: |
+        sed -i 's/@resource_group_name/${{ inputs.AZURE_RG_NAME }}/' ${{ inputs.TERRAFORM_BACKEND_FILE_PATH }}
+        sed -i 's/@storage_account_name/${{ env.TERRAFORM_STORAGE_NAME }}/' ${{ inputs.TERRAFORM_BACKEND_FILE_PATH }}
+
+    - name: Terraform Init
+      shell: bash
+      working-directory: ${{ inputs.TERRAFORM_WORKING_DIR_PATH }}
+      run: terraform init
+
+    - name: Terraform Plan
+      shell: bash
+      working-directory: ${{ inputs.TERRAFORM_WORKING_DIR_PATH }}
+      run: terraform plan
+
+    - name: Terraform Apply
+      shell: bash
+      id: terraform-apply
+      working-directory: ${{ inputs.TERRAFORM_WORKING_DIR_PATH }}
+      run: terraform apply -no-color -auto-approve
