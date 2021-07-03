@@ -7,9 +7,9 @@ inputs:
     required: true
   ENVIRONMENT_SHORT:
     required: true
-  TERRAFORM_WORKING_DIR_PATH:
-    required: true
   TERRAFORM_BACKEND_FILE_PATH:
+    required: true
+  TERRAFORM_WORKING_DIR_PATH:
     required: true
   AZURE_TENANT_ID:
     required: true
